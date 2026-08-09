@@ -4,7 +4,7 @@ const express = require('express');
 const session = require('express-session');
 const crypto = require('crypto');
 const path = require('path');
-const { readDB, writeDB } = require('./db');
+const storage = require('./storage');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,9 +15,9 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 const STATUS_ORDER = ['Label created', 'Picked up', 'In transit', 'Arrived at hub', 'Out for delivery', 'Delivered'];
 const REQUIRED_CREATE_FIELDS = ['senderName', 'recipientName', 'origin', 'destination'];
 const EDITABLE_FIELDS = [
-  'senderName', 'senderAddress',
-  'recipientName', 'recipientEmail', 'recipientAddress',
-  'origin', 'destination', 'description', 'weight', 'serviceLevel', 'estimatedDelivery'
+  'senderName', 'senderAddress', 'senderPhone', 'senderEmail',
+  'recipientName', 'recipientEmail', 'recipientPhone', 'recipientAddress',
+  'origin', 'destination', 'weight', 'serviceLevel', 'estimatedDelivery'
 ];
 
 if (IS_PROD) app.set('trust proxy', 1);
@@ -40,34 +40,41 @@ function requireAdmin(req, res, next) {
   if (req.session && req.session.isAdmin) return next();
   return res.status(401).json({ error: 'Not authenticated' });
 }
-
 function normalizeTN(raw) {
   return String(raw || '').trim().toUpperCase().replace(/\s+/g, '');
 }
-
-function genTrackingNumber(db) {
+function cleanContents(input, fallbackDescription) {
+  if (Array.isArray(input)) {
+    return input.map(s => String(s).trim()).filter(Boolean);
+  }
+  if (fallbackDescription) return [String(fallbackDescription).trim()].filter(Boolean);
+  return [];
+}
+async function genTrackingNumber() {
   let tn;
   do {
     tn = 'MC-' + Math.floor(1000000 + Math.random() * 8999999);
-  } while (db.shipments[tn]);
+  } while (await storage.shipmentExists(tn));
   return tn;
 }
 
+/* ---------------- admin page (not linked from the public site) ---------------- */
+
+app.get('/admin', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+
 /* ---------------- public tracking ---------------- */
 
-app.get('/api/track/:trackingNumber', (req, res) => {
-  const db = readDB();
+app.get('/api/track/:trackingNumber', async (req, res) => {
   const tn = normalizeTN(req.params.trackingNumber);
-  const pkg = db.shipments[tn];
+  const pkg = await storage.getShipment(tn);
   if (!pkg) return res.status(404).json({ error: 'No shipment found with that tracking number.' });
   res.json(pkg);
 });
 
-app.get('/api/track-by-email/:email', (req, res) => {
-  const db = readDB();
-  const email = String(req.params.email || '').trim().toLowerCase();
-  const matches = Object.values(db.shipments)
-    .filter(p => (p.recipientEmail || '').toLowerCase() === email)
+app.get('/api/track-by-email/:email', async (req, res) => {
+  const matches = (await storage.findByEmail(req.params.email))
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   res.json(matches);
 });
@@ -93,21 +100,31 @@ app.get('/api/admin/session', (req, res) => {
 
 /* ---------------- admin: shipments ---------------- */
 
-app.get('/api/shipments', requireAdmin, (req, res) => {
-  const db = readDB();
-  const list = Object.values(db.shipments).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+app.get('/api/shipments', requireAdmin, async (req, res) => {
+  const list = (await storage.listShipments()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   res.json(list);
 });
 
-app.post('/api/shipments', requireAdmin, (req, res) => {
+app.post('/api/shipments', requireAdmin, async (req, res) => {
   const b = req.body || {};
   const missing = REQUIRED_CREATE_FIELDS.filter(f => !b[f] || !String(b[f]).trim());
   if (missing.length) {
     return res.status(400).json({ error: 'Missing required fields: ' + missing.join(', ') });
   }
 
-  const db = readDB();
-  const tn = genTrackingNumber(db);
+  let tn;
+  if (b.customTrackingNumber && String(b.customTrackingNumber).trim()) {
+    tn = normalizeTN(b.customTrackingNumber);
+    if (!/^[A-Z0-9-]{4,32}$/.test(tn)) {
+      return res.status(400).json({ error: 'Custom tracking numbers can only use letters, numbers, and dashes (4-32 characters).' });
+    }
+    if (await storage.shipmentExists(tn)) {
+      return res.status(409).json({ error: 'That tracking number is already in use — pick another.' });
+    }
+  } else {
+    tn = await genTrackingNumber();
+  }
+
   const now = new Date().toISOString();
   const shippedAt = b.shippedAt ? new Date(b.shippedAt).toISOString() : now;
 
@@ -115,12 +132,15 @@ app.post('/api/shipments', requireAdmin, (req, res) => {
     trackingNumber: tn,
     senderName: b.senderName.trim(),
     senderAddress: (b.senderAddress || '').trim(),
+    senderPhone: (b.senderPhone || '').trim(),
+    senderEmail: (b.senderEmail || '').trim(),
     recipientName: b.recipientName.trim(),
     recipientEmail: (b.recipientEmail || '').trim(),
+    recipientPhone: (b.recipientPhone || '').trim(),
     recipientAddress: (b.recipientAddress || '').trim(),
     origin: b.origin.trim(),
     destination: b.destination.trim(),
-    description: (b.description || '').trim(),
+    contents: cleanContents(b.contents, b.description),
     weight: (b.weight || '').trim(),
     serviceLevel: b.serviceLevel === 'Express' ? 'Express' : 'Standard',
     shippedAt,
@@ -136,29 +156,29 @@ app.post('/api/shipments', requireAdmin, (req, res) => {
     }]
   };
 
-  db.shipments[tn] = pkg;
-  writeDB(db);
+  await storage.saveShipment(pkg);
   res.status(201).json(pkg);
 });
 
-app.patch('/api/shipments/:trackingNumber', requireAdmin, (req, res) => {
-  const db = readDB();
+app.patch('/api/shipments/:trackingNumber', requireAdmin, async (req, res) => {
   const tn = normalizeTN(req.params.trackingNumber);
-  const pkg = db.shipments[tn];
+  const pkg = await storage.getShipment(tn);
   if (!pkg) return res.status(404).json({ error: 'Not found' });
 
   EDITABLE_FIELDS.forEach(f => {
     if (req.body[f] !== undefined) pkg[f] = req.body[f];
   });
+  if (req.body.contents !== undefined) {
+    pkg.contents = cleanContents(req.body.contents);
+  }
   pkg.updatedAt = new Date().toISOString();
-  writeDB(db);
+  await storage.saveShipment(pkg);
   res.json(pkg);
 });
 
-app.post('/api/shipments/:trackingNumber/events', requireAdmin, (req, res) => {
-  const db = readDB();
+app.post('/api/shipments/:trackingNumber/events', requireAdmin, async (req, res) => {
   const tn = normalizeTN(req.params.trackingNumber);
-  const pkg = db.shipments[tn];
+  const pkg = await storage.getShipment(tn);
   if (!pkg) return res.status(404).json({ error: 'Not found' });
 
   const { status, location, note } = req.body || {};
@@ -170,28 +190,33 @@ app.post('/api/shipments/:trackingNumber/events', requireAdmin, (req, res) => {
   pkg.history.push({ status, location: (location || '').trim(), timestamp: now, note: (note || '').trim() });
   pkg.status = status;
   pkg.updatedAt = now;
-  writeDB(db);
+  await storage.saveShipment(pkg);
   res.json(pkg);
 });
 
-app.delete('/api/shipments/:trackingNumber', requireAdmin, (req, res) => {
-  const db = readDB();
+app.delete('/api/shipments/:trackingNumber', requireAdmin, async (req, res) => {
   const tn = normalizeTN(req.params.trackingNumber);
-  if (!db.shipments[tn]) return res.status(404).json({ error: 'Not found' });
-  delete db.shipments[tn];
-  writeDB(db);
+  const ok = await storage.deleteShipment(tn);
+  if (!ok) return res.status(404).json({ error: 'Not found' });
   res.json({ ok: true });
 });
 
-/* ---------------- fallback to SPA ---------------- */
+/* ---------------- fallback to the public site ---------------- */
 
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`Meridian Cargo listening on port ${PORT}`);
-  if (ADMIN_PASSWORD === 'changeme') {
-    console.warn('WARNING: using default admin password — set ADMIN_PASSWORD in your environment.');
-  }
-});
+storage.init()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Meridian Cargo listening on port ${PORT}`);
+      if (ADMIN_PASSWORD === 'changeme') {
+        console.warn('WARNING: using the default admin password — set ADMIN_PASSWORD in your environment.');
+      }
+    });
+  })
+  .catch(err => {
+    console.error('Failed to initialize storage:', err);
+    process.exit(1);
+  });
